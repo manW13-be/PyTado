@@ -1,6 +1,17 @@
 """
-Do all the API HTTP heavy lifting in this file
+PyTado HTTP layer — fixed fork of python-tado 0.19.2
+
+Fixes vs upstream:
+  1. device_verification_url now includes client_id (upstream omits it → auth server rejects)
+  2. _refresh_token uses form-encoded body (upstream sends params as query string + empty JSON body)
+  3. _check_device_activation uses same form-encoded format for consistency
+  4. Expired/invalid token with existing token file now falls back to device flow automatically
+     instead of leaving the client stuck in NOT_STARTED with no recovery path
+  5. client_id accepted as constructor parameter — no more module-level global mutation
+     (CLIENT_ID_DEVICE in const.py is kept as the default value only)
 """
+
+from __future__ import annotations
 
 import enum
 import json
@@ -12,61 +23,62 @@ from datetime import datetime, timedelta, timezone
 from json import dump as json_dump
 from json import load as json_load
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 from urllib.parse import urlencode
 
 import requests
 
-from PyTado.const import CLIENT_ID_DEVICE
+import PyTado.const as _const
 from PyTado.exceptions import TadoException, TadoWrongCredentialsException
 from PyTado.logger import Logger
 
 _LOGGER = Logger(__name__)
 
+_AUTH_URL     = "https://login.tado.com/oauth2/token"
+_DEVICE_URL   = "https://login.tado.com/oauth2/device_authorize"
+_REFERER      = "https://app.tado.com/"
+_DEFAULT_TIMEOUT = 10
+_DEFAULT_RETRIES = 5
 
-class Endpoint(enum.StrEnum):
+
+class Endpoint(str, enum.Enum):
     """Endpoint URL Enum"""
-
-    MY_API = "https://my.tado.com/api/v2/"
+    MY_API   = "https://my.tado.com/api/v2/"
     HOPS_API = "https://hops.tado.com/"
-    MOBILE = "https://my.tado.com/mobile/1.9/"
-    EIQ = "https://energy-insights.tado.com/api/"
-    TARIFF = "https://tariff-experience.tado.com/api/"
-    GENIE = "https://genie.tado.com/api/v2/"
-    MINDER = "https://minder.tado.com/v1/"
+    MOBILE   = "https://my.tado.com/mobile/1.9/"
+    EIQ      = "https://energy-insights.tado.com/api/"
+    TARIFF   = "https://tariff-experience.tado.com/api/"
+    GENIE    = "https://genie.tado.com/api/v2/"
+    MINDER   = "https://minder.tado.com/v1/"
 
 
-class Domain(enum.StrEnum):
+class Domain(str, enum.Enum):
     """API Request Domain Enum"""
-
-    HOME = "homes"
-    DEVICES = "devices"
-    ME = "me"
+    HOME           = "homes"
+    DEVICES        = "devices"
+    ME             = "me"
     HOME_BY_BRIDGE = "homeByBridge"
 
 
-class Action(enum.StrEnum):
+class Action(str, enum.Enum):
     """API Request Action Enum"""
-
-    GET = "GET"
-    SET = "POST"
-    RESET = "DELETE"
+    GET    = "GET"
+    SET    = "POST"
+    RESET  = "DELETE"
     CHANGE = "PUT"
 
 
 class Mode(enum.Enum):
     """API Response Format Enum"""
-
     OBJECT = 1
-    PLAIN = 2
+    PLAIN  = 2
 
 
-class DeviceActivationStatus(enum.StrEnum):
+class DeviceActivationStatus(str, enum.Enum):
     """Device Activation Status Enum"""
-
     NOT_STARTED = "NOT_STARTED"
-    PENDING = "PENDING"
-    COMPLETED = "COMPLETED"
+    PENDING     = "PENDING"
+    COMPLETED   = "COMPLETED"
 
 
 class TadoRequest:
@@ -75,22 +87,22 @@ class TadoRequest:
     def __init__(
         self,
         endpoint: Endpoint = Endpoint.MY_API,
-        command: str | None = None,
-        action: Action | str = Action.GET,
-        payload: dict[str, Any] | None = None,
+        command: Optional[str] = None,
+        action: Action = Action.GET,
+        payload: Optional[dict] = None,
         domain: Domain = Domain.HOME,
-        device: int | str | None = None,
+        device: Optional[Any] = None,
         mode: Mode = Mode.OBJECT,
-        params: dict[str, Any] | None = None,
+        params: Optional[dict] = None,
     ) -> None:
         self.endpoint = endpoint
-        self.command = command
-        self.action = action
-        self.payload = payload
-        self.domain = domain
-        self.device = device
-        self.mode = mode
-        self.params = params
+        self.command  = command
+        self.action   = action
+        self.payload  = payload
+        self.domain   = domain
+        self.device   = device
+        self.mode     = mode
+        self.params   = params
 
 
 class TadoXRequest(TadoRequest):
@@ -99,153 +111,110 @@ class TadoXRequest(TadoRequest):
     def __init__(
         self,
         endpoint: Endpoint = Endpoint.HOPS_API,
-        command: str | None = None,
-        action: Action | str = Action.GET,
-        payload: dict[str, Any] | None = None,
+        command: Optional[str] = None,
+        action: Action = Action.GET,
+        payload: Optional[dict] = None,
         domain: Domain = Domain.HOME,
-        device: int | str | None = None,
+        device: Optional[Any] = None,
         mode: Mode = Mode.OBJECT,
-        params: dict[str, Any] | None = None,
+        params: Optional[dict] = None,
     ) -> None:
         super().__init__(
-            endpoint=endpoint,
-            command=command,
-            action=action,
-            payload=payload,
-            domain=domain,
-            device=device,
-            mode=mode,
-            params=params,
+            endpoint=endpoint, command=command, action=action,
+            payload=payload, domain=domain, device=device, mode=mode, params=params,
         )
         self._action = action
 
     @property
-    def action(self) -> Action | str:
-        """Get request action for Tado X"""
+    def action(self) -> Action:
         if self._action == Action.CHANGE:
             return "PATCH"
         return self._action
 
     @action.setter
-    def action(self, value: Action | str) -> None:
-        """Set request action"""
+    def action(self, value: Action) -> None:
         self._action = value
 
 
-class TadoResponse:
-    """Unimplemented Response Container
-    todo: implement response parser"""
-
-    pass
-
-
-_DEFAULT_TIMEOUT = 10
-_DEFAULT_RETRIES = 5
-
-
 class Http:
-    """API Request Class"""
+    """API Request Class — fixed fork of python-tado 0.19.2"""
 
     def __init__(
         self,
-        token_file_path: str | None = None,
-        saved_refresh_token: str | None = None,
-        http_session: requests.Session | None = None,
+        token_file_path: Optional[str] = None,
+        saved_refresh_token: Optional[str] = None,
+        http_session: Optional[requests.Session] = None,
         debug: bool = False,
+        client_id: Optional[str] = None,      # FIX 5: per-instance client_id
     ) -> None:
         """
-        Initialize the HTTP client for interacting with the Tado API.
-
         Args:
-            token_file_path (str | None): Path to the file where the token is stored.
-                If None, the token will not be saved to a file.
-            saved_refresh_token (str | None): A previously saved refresh token to use for
-                authentication. If None, a new token will be requested.
-            http_session (requests.Session | None): An optional pre-configured HTTP session.
-                If None, a new session will be created.
-            debug (bool): If True, enables debug logging. Defaults to False.
-
-        Returns:
-            None
+            token_file_path: Path where the refresh token is persisted.
+            saved_refresh_token: Pre-existing refresh token (alternative to file).
+            http_session: Optional pre-configured requests.Session.
+            debug: Enable debug logging.
+            client_id: OAuth2 client_id. Defaults to CLIENT_ID_DEVICE from const.py.
+                       Pass explicitly instead of monkey-patching PyTado.const.CLIENT_ID_DEVICE.
         """
-
         if debug:
             _LOGGER.setLevel(logging.DEBUG)
         else:
             _LOGGER.setLevel(logging.WARNING)
 
+        # FIX 5: store client_id per-instance; fall back to module-level default
+        self._client_id = client_id or _const.CLIENT_ID_DEVICE
+
         self._refresh_at = datetime.now(timezone.utc) + timedelta(minutes=10)
-        self._session = http_session or self._create_session()
-        self._session.hooks["response"].append(self._log_response)
-        self._headers = {"Referer": "https://app.tado.com/"}
+        self._session    = http_session or self._create_session()
+        self._headers    = {"Referer": _REFERER}
 
-        self._user_code: str | None = None
-        self._device_verification_url: str | None = None
+        self._user_code:               Optional[str]      = None
+        self._device_verification_url: Optional[str]      = None
         self._device_activation_status = DeviceActivationStatus.NOT_STARTED
-        self._expires_at: datetime | None = None
+        self._expires_at:              Optional[datetime] = None
+        self._device_flow_data:        Optional[dict]     = None
 
-        self._id: int | None = None
-        self._token_refresh: str | None = None
-        self._x_api: bool | None = None
+        self._id:            Optional[int]  = None
+        self._token_refresh: Optional[str]  = None
+        self._x_api:         Optional[bool] = None
         self._token_file_path = token_file_path
 
         if saved_refresh_token or self._load_token():
             if self._refresh_token(refresh_token=saved_refresh_token, force_refresh=True):
                 self._device_ready()
+            else:
+                # FIX 4: token file exists but token is expired/invalid → start device flow
+                # Upstream leaves the client stuck in NOT_STARTED with no recovery path.
+                _LOGGER.warning(
+                    "Stored token is invalid or expired. Starting device flow."
+                )
+                self._device_activation_status = self._login_device_flow()
         else:
             self._device_activation_status = self._login_device_flow()
 
-    @property
-    def is_x_line(self) -> bool | None:
-        """
-        Check if the current line is an X line.
+    # ── Properties ────────────────────────────────────────────────────────────
 
-        Returns:
-            bool | None: True if the current line is an X line, False otherwise.
-                         None if the api is not ready yet.
-        """
+    @property
+    def is_x_line(self) -> Optional[bool]:
         return self._x_api
 
     @property
-    def user_code(self) -> str | None:
-        """
-        Retrieve the user code.
-
-        Returns:
-            str | None: The user code if available, otherwise None.
-        """
+    def user_code(self) -> Optional[str]:
         return self._user_code
 
     @property
     def device_activation_status(self) -> DeviceActivationStatus:
-        """
-        Retrieve the activation status of the device.
-
-        Returns:
-            DeviceActivationStatus: The current activation status of the device.
-        """
         return self._device_activation_status
 
     @property
-    def device_verification_url(self) -> str | None:
-        """
-        Retrieve the url to activate the device.
-
-        Returns:
-            str | None: The current url for device activation or none if
-                        authentication is not started.
-        """
+    def device_verification_url(self) -> Optional[str]:
         return self._device_verification_url
 
     @property
-    def refresh_token(self) -> str | None:
-        """
-        Retrieve the current refresh token for the tado api connection.
-
-        Returns:
-            str | None: The current refresh token, or None if not available.
-        """
+    def refresh_token(self) -> Optional[str]:
         return self._token_refresh
+
+    # ── Session ───────────────────────────────────────────────────────────────
 
     def _create_session(self) -> requests.Session:
         session = requests.Session()
@@ -253,68 +222,51 @@ class Http:
         return session
 
     def _log_response(self, response: requests.Response, *args, **kwargs) -> None:
-        og_request_method = response.request.method
-        og_request_url = response.request.url
-        og_request_headers = response.request.headers
-        response_status = response.status_code
-
-        if response.text is None or response.text == "":
-            response_data = {}
-        else:
-            response_data = response.json()
-
         _LOGGER.debug(
-            f"\nRequest:\n\tMethod:{og_request_method}"
-            f"\n\tURL: {og_request_url}"
-            f"\n\tHeaders: {pprint.pformat(og_request_headers)}"
-            f"\nResponse:\n\tStatusCode: {response_status}"
-            f"\n\tData: {response_data}"
+            "\nRequest:\n\tMethod: %s\n\tURL: %s\nResponse:\n\tStatus: %s\n\tData: %s",
+            response.request.method,
+            response.request.url,
+            response.status_code,
+            pprint.pformat(response.json() if response.text else {}),
         )
 
-    def request(self, request: TadoRequest) -> dict[str, Any]:
-        """Request something from the API with a TadoRequest"""
+    # ── API Request ───────────────────────────────────────────────────────────
+
+    def request(self, request: TadoRequest) -> dict:
+        """Execute an API request. Refreshes the access token automatically."""
         self._refresh_token()
 
-        headers = self._headers
-        data = self._configure_payload(headers, request)
-        url = self._configure_url(request)
+        headers = dict(self._headers)
+        body    = self._configure_payload(headers, request)
+        url     = self._configure_url(request)
 
-        http_request = requests.Request(method=request.action, url=url, headers=headers, data=data)
-        prepped = http_request.prepare()
-        prepped.hooks["response"].append(self._log_response)
+        http_req = requests.Request(method=request.action, url=url, headers=headers, data=body)
+        prepped  = http_req.prepare()
 
         retries = _DEFAULT_RETRIES
-
         while retries >= 0:
             try:
-                response = self._session.send(prepped)
+                response = self._session.send(prepped, timeout=_DEFAULT_TIMEOUT)
                 break
-            except TadoWrongCredentialsException as e:
-                _LOGGER.error("Credentials Exception: %s", e)
-                raise e
-            except requests.exceptions.ConnectionError as e:
+            except TadoWrongCredentialsException as exc:
+                raise exc
+            except requests.exceptions.ConnectionError as exc:
                 if retries > 0:
-                    _LOGGER.warning("Connection error: %s", e)
+                    _LOGGER.warning("Connection error: %s — retrying", exc)
                     self._session.close()
                     self._session = self._create_session()
                     retries -= 1
                 else:
-                    _LOGGER.error(
-                        "Connection failed after %d retries: %s",
-                        _DEFAULT_RETRIES,
-                        e,
-                    )
-                    raise TadoException(e) from e
+                    raise TadoException(exc) from exc
 
-        if response.text is None or response.text == "":
+        if not response.text:
             return {}
-
         return response.json()
 
     def _configure_url(self, request: TadoRequest) -> str:
         if request.endpoint == Endpoint.MOBILE:
             url = f"{request.endpoint}{request.command}"
-        elif request.domain == Domain.DEVICES or request.domain == Domain.HOME_BY_BRIDGE:
+        elif request.domain in (Domain.DEVICES, Domain.HOME_BY_BRIDGE):
             url = f"{request.endpoint}{request.domain}/{request.device}/{request.command}"
         elif request.domain == Domain.ME:
             url = f"{request.endpoint}{request.domain}"
@@ -322,242 +274,225 @@ class Http:
             url = f"{request.endpoint}{request.domain}/{self._id:d}/{request.command}"
 
         if request.params is not None:
-            params = request.params
-            url += f"?{urlencode(params)}"
-
+            url += f"?{urlencode(request.params)}"
         return url
 
-    def _configure_payload(self, headers: dict[str, str], request: TadoRequest) -> bytes:
+    def _configure_payload(self, headers: dict, request: TadoRequest) -> bytes:
         if request.payload is None:
             return b""
-
         if request.mode == Mode.PLAIN:
             headers["Content-Type"] = "text/plain;charset=UTF-8"
         else:
             headers["Content-Type"] = "application/json;charset=UTF-8"
         headers["Mime-Type"] = "application/json;charset=UTF-8"
-        return json.dumps(request.payload).encode("utf8")
+        return json.dumps(request.payload).encode("utf-8")
 
-    def _set_oauth_header(self, data: dict[str, Any]) -> str:
-        """Set the OAuth header and return the refresh token"""
+    # ── OAuth2 token management ───────────────────────────────────────────────
 
-        access_token = data["access_token"]
-        expires_in = float(data["expires_in"])
+    def _set_oauth_header(self, data: dict) -> None:
+        access_token  = data["access_token"]
+        expires_in    = float(data["expires_in"])
         refresh_token = data["refresh_token"]
 
         self._token_refresh = refresh_token
-        self._refresh_at = datetime.now(timezone.utc)
-        self._refresh_at = self._refresh_at + timedelta(seconds=expires_in)
-        # We subtract 30 seconds from the correct refresh time.
-        # Then we have a 30 seconds timespan to get a new refresh_token
-        self._refresh_at = self._refresh_at - timedelta(seconds=30)
-
+        self._refresh_at    = (
+            datetime.now(timezone.utc)
+            + timedelta(seconds=expires_in)
+            - timedelta(seconds=30)
+        )
         self._headers["Authorization"] = f"Bearer {access_token}"
-
         self._save_token()
 
-        return refresh_token
-
     def _load_token(self) -> bool:
-        """Load the refresh token from a file."""
-
+        """Load refresh token from file. Returns True if a token was found."""
         if not self._token_file_path or not os.path.exists(self._token_file_path):
             return False
-
         try:
             with open(self._token_file_path, encoding="utf-8") as f:
-                data = json_load(f)
-                self._token_refresh = data.get("refresh_token")
+                self._token_refresh = json_load(f).get("refresh_token")
+            return bool(self._token_refresh)
+        except (OSError, json.JSONDecodeError) as exc:
+            _LOGGER.error("Failed to load token: %s", exc)
+            raise TadoException(exc) from exc
 
-            _LOGGER.debug("Refresh token loaded from %s", self._token_file_path)
-
-            return True
-        except (OSError, json.JSONDecodeError) as e:
-            _LOGGER.error("Failed to load refresh token: %s", e)
-            raise TadoException(e) from e
-
-    def _refresh_token(self, refresh_token: str | None = None, force_refresh: bool = False) -> bool:
+    def _refresh_token(
+        self,
+        refresh_token: Optional[str] = None,
+        force_refresh: bool = False,
+    ) -> bool:
         """
-        Refresh the OAuth token if it is about to expire or if forced.
+        Refresh the OAuth access token.
 
-        Args:
-            refresh_token (str | None, optional): The refresh token to use for obtaining a new
-                access token.
-            force_refresh (bool, optional): If True, forces a token refresh regardless of
-                expiration. Defaults to False.
-
-        Returns:
-            bool: True if the token was successfully refreshed, False if the refresh failed due
-                  to invalid credentials.
-
-        Raises:
-            TadoException: If a connection error occurs during the token refresh process.
-            TadoWrongCredentialsException: If the token refresh fails due to invalid credentials
-                and force_refresh is False.
+        FIX 2/3: uses form-encoded body (application/x-www-form-urlencoded) instead of
+        upstream's query-string + empty JSON body. The Tado login server requires the
+        parameters to be in the request body, not the URL.
         """
-
         if self._refresh_at >= datetime.now(timezone.utc) and not force_refresh:
             return True
 
-        url = "https://login.tado.com/oauth2/token"
         data = {
-            "client_id": CLIENT_ID_DEVICE,
-            "grant_type": "refresh_token",
+            "client_id":     self._client_id,
+            "grant_type":    "refresh_token",
             "refresh_token": refresh_token or self._token_refresh,
         }
+
         self._session.close()
         self._session = self._create_session()
 
         try:
             response = self._session.request(
-                "post",
-                url,
-                params=data,
-                timeout=_DEFAULT_TIMEOUT,
-                data=json.dumps({}).encode("utf8"),
+                "POST",
+                _AUTH_URL,
+                data=urlencode(data),           # form-encoded body
                 headers={
-                    "Content-Type": "application/json",
-                    "Referer": "https://app.tado.com/",
+                    "Content-Type": "application/x-www-form-urlencoded",
+                    "Referer":      _REFERER,
                 },
+                timeout=_DEFAULT_TIMEOUT,
             )
-
-        except requests.exceptions.ConnectionError as e:
-            _LOGGER.error("Connection error: %s", e)
-            raise TadoException(e) from e
+        except requests.exceptions.ConnectionError as exc:
+            raise TadoException(exc) from exc
 
         if response.status_code != 200:
             if force_refresh:
                 _LOGGER.error(
-                    "Failed to refresh token, probably wrong credentials. Status code: %s",
+                    "Token refresh failed (status %s). Token is expired or invalid.",
                     response.status_code,
                 )
                 return False
-
             raise TadoWrongCredentialsException(
-                "Failed to refresh token, probably wrong credentials. "
-                f"Status code: {response.status_code}"
+                f"Token refresh failed. Status: {response.status_code}"
             )
 
         self._set_oauth_header(response.json())
-
         return True
 
-    def _save_token(self):
-        """Save the refresh token to a file."""
+    def _save_token(self) -> None:
+        """Save the current refresh token to file."""
         if not self._token_file_path or not self._token_refresh:
             return
-
         try:
             token_dir = os.path.dirname(self._token_file_path)
-            if token_dir and not os.path.exists(token_dir):
+            if token_dir:
                 Path(token_dir).mkdir(parents=True, exist_ok=True)
-
             with open(self._token_file_path, "w", encoding="utf-8") as f:
-                json_dump(
-                    {"refresh_token": self._token_refresh},
-                    f,
-                )
+                json_dump({"refresh_token": self._token_refresh}, f)
+        except Exception as exc:
+            _LOGGER.error("Failed to save token: %s", exc)
+            raise TadoException(exc) from exc
 
-            _LOGGER.debug("Refresh token saved to %s", self._token_file_path)
-        except Exception as e:
-            _LOGGER.error("Failed to save refresh token: %s", e)
-            raise TadoException(e) from e
+    # ── OAuth2 device flow ────────────────────────────────────────────────────
 
     def _login_device_flow(self) -> DeviceActivationStatus:
-        """Start the login to the API using the device flow"""
+        """
+        Start the OAuth2 device authorization flow.
 
+        FIX 1 (partial): the verification URL is built with both user_code AND client_id,
+        so the Tado auth server can identify the application. Upstream only adds user_code.
+        FIX 3: sends params as form-encoded body, consistent with _refresh_token.
+        """
         if self._device_activation_status != DeviceActivationStatus.NOT_STARTED:
-            raise TadoException("The device has been started already")
+            raise TadoException("Device flow already started")
 
-        url = "https://login.tado.com/oauth2/device_authorize"
         data = {
-            "client_id": CLIENT_ID_DEVICE,
-            "scope": "offline_access",
+            "client_id": self._client_id,
+            "scope":     "offline_access",
         }
 
         try:
             response = self._session.request(
-                method="post",
-                url=url,
-                params=data,
-                timeout=_DEFAULT_TIMEOUT,
-                data=json.dumps({}).encode("utf8"),
+                "POST",
+                _DEVICE_URL,
+                data=urlencode(data),
                 headers={
-                    "Content-Type": "application/json",
-                    "Referer": "https://app.tado.com/",
+                    "Content-Type": "application/x-www-form-urlencoded",
+                    "Referer":      _REFERER,
                 },
+                timeout=_DEFAULT_TIMEOUT,
             )
-        except requests.exceptions.ConnectionError as e:
-            raise TadoException(e) from e
+        except requests.exceptions.ConnectionError as exc:
+            raise TadoException(exc) from exc
 
         if response.status_code != 200:
             raise TadoException(
-                f"Login failed. Status code: {response.status_code} and reason: {response.reason}"
+                f"Device flow init failed. Status {response.status_code}: {response.reason}"
             )
 
         self._device_flow_data = response.json()
-        _LOGGER.debug("Device flow response: %s", self._device_flow_data)
 
-        user_code = urlencode({"user_code": self._device_flow_data["user_code"]})
-        visit_url = f"{self._device_flow_data['verification_uri']}?{user_code}"
+        # FIX 1: include client_id in verification URL so the auth server can identify the app.
+        # Upstream builds: verification_uri?user_code=XXX  (client_id missing → auth rejected)
+        # Fixed:           verification_uri?user_code=XXX&client_id=YYY
         self._user_code = self._device_flow_data["user_code"]
-        self._device_verification_url = visit_url
-
-        _LOGGER.info("Please visit the following URL: %s", visit_url)
-
-        expires_in_seconds = self._device_flow_data["expires_in"]
-        self._expires_at = datetime.now(timezone.utc) + timedelta(seconds=expires_in_seconds)
-
-        _LOGGER.info(
-            "Waiting for user to authorize the device. Expires at %s",
-            self._expires_at.strftime("%Y-%m-%d %H:%M:%S"),
+        self._device_verification_url = (
+            self._device_flow_data["verification_uri"]
+            + "?"
+            + urlencode({
+                "user_code": self._user_code,
+                "client_id": self._client_id,
+            })
         )
+
+        _LOGGER.info("Verification URL: %s", self._device_verification_url)
+
+        expires_in = self._device_flow_data.get("expires_in", 600)
+        self._expires_at = datetime.now(timezone.utc) + timedelta(seconds=expires_in)
 
         return DeviceActivationStatus.PENDING
 
     def _check_device_activation(self) -> bool:
+        """
+        Poll the token endpoint once. Returns True when the user has approved.
+
+        FIX 3: consistent form-encoded body, same as _refresh_token and _login_device_flow.
+        Upstream sends params as query string without Content-Type headers.
+        """
         if (
             self._expires_at is not None
-            and datetime.timestamp(datetime.now(timezone.utc))
-            > datetime.timestamp(self._expires_at)
+            and datetime.now(timezone.utc) > self._expires_at
         ):
-            raise TadoException("User took too long to enter key")
+            raise TadoException("Device authorization expired — user took too long")
 
-        # Await the desired interval, before polling the API again
-        time.sleep(self._device_flow_data["interval"])
+        interval = self._device_flow_data.get("interval", 5) if self._device_flow_data else 5
+        time.sleep(interval)
+
+        data = {
+            "client_id":   self._client_id,
+            "device_code": self._device_flow_data["device_code"],
+            "grant_type":  "urn:ietf:params:oauth:grant-type:device_code",
+        }
 
         try:
-            token_response = self._session.request(
-                method="post",
-                url="https://login.tado.com/oauth2/token",
-                params={
-                    "client_id": CLIENT_ID_DEVICE,
-                    "device_code": self._device_flow_data["device_code"],
-                    "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
+            response = self._session.request(
+                "POST",
+                _AUTH_URL,
+                data=urlencode(data),
+                headers={
+                    "Content-Type": "application/x-www-form-urlencoded",
+                    "Referer":      _REFERER,
                 },
+                timeout=_DEFAULT_TIMEOUT,
             )
-        except requests.exceptions.ConnectionError as e:
-            raise TadoException(e) from e
+        except requests.exceptions.ConnectionError as exc:
+            raise TadoException(exc) from exc
 
-        if token_response.status_code == 200:
-            self._set_oauth_header(token_response.json())
+        if response.status_code == 200:
+            self._set_oauth_header(response.json())
             return True
 
-        # The user has not yet authorized the device, let's continue
         if (
-            token_response.status_code == 400
-            and token_response.json()["error"] == "authorization_pending"
+            response.status_code == 400
+            and response.json().get("error") == "authorization_pending"
         ):
-            _LOGGER.info("Authorization pending, waiting for user to authorize. Continue polling.")
+            _LOGGER.info("Authorization pending — waiting for user to approve")
             return False
 
-        raise TadoException(f"Login failed. Reason: {token_response.reason}")
+        raise TadoException(f"Device activation failed: {response.reason}")
 
     def device_activation(self) -> None:
-        """Activate the device and get the refresh token"""
-
+        """Block until the user approves the device flow, then mark as COMPLETED."""
         if self._device_activation_status == DeviceActivationStatus.NOT_STARTED:
-            raise TadoException("The device flow has not yet started")
+            raise TadoException("Device flow has not been started")
 
         while True:
             if self._check_device_activation():
@@ -565,30 +500,28 @@ class Http:
 
         self._device_ready()
 
-    def _device_ready(self):
-        """after device refresh code has been obtained"""
-        self._id = self._get_id()
+    def _device_ready(self) -> None:
+        """Called once the token is valid — resolve home ID and API variant."""
+        self._id    = self._get_id()
         self._x_api = self._check_x_line_generation()
-        self._user_code = None
+        self._user_code               = None
         self._device_verification_url = None
         self._device_activation_status = DeviceActivationStatus.COMPLETED
 
     def _get_id(self) -> int:
-        request = TadoRequest()
-        request.action = Action.GET
-        request.domain = Domain.ME
+        req = TadoRequest(action=Action.GET, domain=Domain.ME)
+        me = self.request(req)
+        if me.get("homes"):
+            return int(me["homes"][0]["id"])
+        if "homeId" in me:
+            return int(me["homeId"])
+        if isinstance(me.get("home"), dict):
+            return int(me["home"]["id"])
+        if me.get("homeIds"):
+            return int(me["homeIds"][0])
+        raise TadoException(f"Cannot extract home ID from /me response: {me}")
 
-        homes_ = self.request(request)["homes"]
-
-        return homes_[0]["id"]
-
-    def _check_x_line_generation(self):
-        # get home info
-        request = TadoRequest()
-        request.action = Action.GET
-        request.domain = Domain.HOME
-        request.command = ""
-
-        home_ = self.request(request)
-
-        return "generation" in home_ and home_["generation"] == "LINE_X"
+    def _check_x_line_generation(self) -> bool:
+        req = TadoRequest(action=Action.GET, domain=Domain.HOME, command="")
+        home = self.request(req)
+        return "generation" in home and home["generation"] == "LINE_X"

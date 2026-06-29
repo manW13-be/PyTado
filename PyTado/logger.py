@@ -1,19 +1,13 @@
-"""
-This file contains anything related to logging
-"""
+"""Custom logger for PyTado."""
 
 import logging
 
 
 class Logger(logging.Logger):
-    """
-    This class provides a custom logger without masking sensitive information.
-    """
+    """Custom logger without masking sensitive information."""
 
     class SimpleFormatter(logging.Formatter):
-        """
-        Simple formatter that does not remove any information in logs.
-        """
+        """Simple formatter."""
 
     def __init__(self, name: str, level=logging.NOTSET):
         super().__init__(name)
